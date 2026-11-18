@@ -1,0 +1,745 @@
+# 思维自检与规划系统 · GitHub持久化版（单人自用）
+# 依赖：streamlit pandas altair pyvis pygithub
+import json
+import os
+from datetime import datetime
+from difflib import SequenceMatcher
+import streamlit as st
+from pyvis.network import Network
+import altair as alt
+import pandas as pd
+from github import Github
+
+# ====================== 从streamlit secrets读取配置 ======================
+GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+GITHUB_REPO_OWNER = st.secrets["GITHUB_REPO_OWNER"]
+GITHUB_REPO_NAME = st.secrets["GITHUB_REPO_NAME"]
+DATA_FILE_PATH = st.secrets["DATA_FILE_PATH"]
+
+g = Github(GITHUB_TOKEN)
+repo = g.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
+
+# ====================== GitHub读写函数 ======================
+def load_data_from_github():
+    try:
+        contents = repo.get_contents(DATA_FILE_PATH)
+        raw_json = contents.decoded_content.decode("utf-8")
+        d = json.loads(raw_json)
+        d = migrate_data(d)
+        return d, contents.sha
+    except Exception as e:
+        # 文件不存在，初始化空白数据
+        init_data = {
+            "concept_network": [],
+            "life_plans": [],
+            "diary": [],
+            "scheme_records": [],
+            "checkin": [],
+            "mood_records": [],
+            "self_test": [],
+            "task_check": []
+        }
+        return init_data, None
+
+def save_data_to_github(data, sha):
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    if sha is None:
+        repo.create_file(DATA_FILE_PATH, "init mind data", json_str)
+    else:
+        repo.update_file(DATA_FILE_PATH, "update mind record", json_str, sha)
+
+# ====================== 全局配置 ======================
+HOUR_LIGHT = 10
+HOUR_NORMAL = 18
+HOUR_HIGH = 25
+ENERGY_LIGHT = 6
+ENERGY_NORMAL = 10
+ENERGY_HIGH = 14
+SIM_THRESH = 0.75
+REPEAT_THRESH = 2
+
+# ====================== 数据迁移兼容 ======================
+def migrate_data(raw):
+    def ensure_tags(item):
+        if "tags" not in item:
+            item["tags"] = []
+        return item
+    for k in raw:
+        if isinstance(raw[k], list):
+            raw[k] = [ensure_tags(x) for x in raw[k]]
+    return raw
+
+# ====================== 工具函数 ======================
+def collect_all_tags(data):
+    tags = set()
+    for cat in data.values():
+        for rec in cat:
+            for t in rec.get("tags", []):
+                tags.add(t.strip())
+    return sorted(list(tags))
+
+def sim_ratio(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+def get_week_key(dt: datetime):
+    return dt.strftime("%G-W%V")
+
+def filter_records(records, search_text, selected_tags):
+    out = []
+    s = search_text.lower().strip()
+    for r in records:
+        text_buf = json.dumps(r, ensure_ascii=False).lower()
+        match_search = (s == "") or (s in text_buf)
+        rec_tags = r.get("tags", [])
+        match_tag = (len(selected_tags) == 0) or any(t in rec_tags for t in selected_tags)
+        if match_search and match_tag:
+            out.append(r)
+    return out
+
+def check_high_similar_warning(new_a, new_b, link_type, network_data, repeat_thresh=REPEAT_THRESH, sim_thresh=SIM_THRESH):
+    pair_new = tuple(sorted([new_a.strip(), new_b.strip()]))
+    cnt = 0
+    warn_msgs = []
+    for rec in network_data:
+        pa = rec["a"].strip()
+        pb = rec["b"].strip()
+        pair_old = tuple(sorted([pa, pb]))
+        if pair_new == pair_old:
+            cnt += 1
+        if (sim_ratio(new_a, pa) > sim_thresh and sim_ratio(new_b, pb) > sim_thresh) or \
+           (sim_ratio(new_a, pb) > sim_thresh and sim_ratio(new_b, pa) > sim_thresh):
+            if rec["link_type"] == "文字相似":
+                warn_msgs.append(f"历史近似联想：{pa} ↔ {pb}，同为文字相似，反复出现")
+    trigger = False
+    if link_type == "文字相似" and cnt >= repeat_thresh:
+        trigger = True
+        warn_msgs.append(f"⚠️ 该文字相似联想已记录 {cnt} 次，高频脑补链路，极易跳步出错，请核验！")
+    return trigger, warn_msgs
+
+# ====================== 计算模块 ======================
+def calc_total_load(life_plans, new_scheme_list):
+    energy_map = {"低":1, "中":2, "高":3}
+    total_h = 0
+    total_energy_score = 0
+    for p in life_plans:
+        ph = p.get("weekly_hour", 0)
+        pe = p.get("energy_level", "低")
+        total_h += ph
+        total_energy_score += energy_map.get(pe,1)
+    for s in new_scheme_list:
+        sh = s.get("h",0)
+        se = s.get("energy","低")
+        total_h += sh
+        total_energy_score += energy_map.get(se,1)
+    if total_h <= HOUR_LIGHT and total_energy_score <= ENERGY_LIGHT:
+        load_level = "轻松"
+        tips = "✅ 负载充足，余量很大，不容易透支"
+    elif total_h <= HOUR_NORMAL and total_energy_score <= ENERGY_NORMAL:
+        load_level = "适中"
+        tips = "🟡 负载适中，保持节奏，留意疲劳信号"
+    elif total_h <= HOUR_HIGH and total_energy_score <= ENERGY_HIGH:
+        load_level = "偏高"
+        tips = "🟠 负载偏高！容易长期疲惫，建议砍掉次要任务或者拉长周期"
+    else:
+        load_level = "过载"
+        tips = "🔴 严重过载！强烈不建议同时启动，极易崩盘、半途而废"
+    return total_h, total_energy_score, load_level, tips
+
+def detect_plan_conflict(solution_energy_load, solution_target, life_plans, diary_list):
+    conflict_list = []
+    for p in life_plans:
+        conf = False
+        c_msg = ""
+        if p.get("confidence") != "可落地，有预案" and solution_energy_load == "高":
+            conf = True
+            c_msg = f"【精力冲突】规划《{p['plan_name']}》本身风险偏高，新增高精力方案容易崩盘"
+        if 0.25 < sim_ratio(solution_target, p.get("expect_outcome","")) < 0.75:
+            if "放弃" in p["expect_outcome"] or "减少" in p["expect_outcome"]:
+                conf = True
+                c_msg = f"【目标冲突】方案目标和《{p['plan_name']}》预期存在资源争夺"
+        if conf:
+            conflict_list.append(c_msg)
+    recent_diary = diary_list[-3:] if len(diary_list)>=3 else diary_list
+    for d in recent_diary:
+        stuck = d.get("thinking_trap","") + d.get("confusion","")
+        if sim_ratio(solution_target, stuck) > 0.4:
+            conflict_list.append(f"【历史卡点预警】近期日记同类卡点：{stuck[:40]}...，可能重复踩坑")
+    return conflict_list
+
+def aggregate_history_data(data):
+    week_dict = {}
+    def get_week(d_str):
+        try:
+            return datetime.fromisoformat(d_str)
+        except:
+            return datetime.now()
+    for p in data["life_plans"]:
+        dt = get_week(p.get("create_time", datetime.now().isoformat()))
+        wk = get_week_key(dt)
+        if wk not in week_dict:
+            week_dict[wk] = {"week_key":wk,"week_date":dt,"total_h":0,"energy_score":0,"warn_count":0,"stuck_count":0,"avg_scheme_score":0,"scheme_cnt":0,"mood_sum":0,"mood_cnt":0}
+        week_dict[wk]["total_h"] += p.get("weekly_hour",0)
+        e_map = {"低":1,"中":2,"高":3}
+        week_dict[wk]["energy_score"] += e_map.get(p.get("energy_level","低"),1)
+    for d in data["diary"]:
+        dt = get_week(d.get("create_time", datetime.now().isoformat()))
+        wk = get_week_key(dt)
+        if wk not in week_dict:
+            week_dict[wk] = {"week_key":wk,"week_date":dt,"total_h":0,"energy_score":0,"warn_count":0,"stuck_count":0,"avg_scheme_score":0,"scheme_cnt":0,"mood_sum":0,"mood_cnt":0}
+        if d.get("confusion","").strip():
+            week_dict[wk]["stuck_count"] +=1
+        mv = d.get("mood_val",3)
+        week_dict[wk]["mood_sum"] += mv
+        week_dict[wk]["mood_cnt"] +=1
+    for rec in data["concept_network"]:
+        if rec.get("trigger_high_similar_warn",False):
+            dt = get_week(rec.get("create_time", datetime.now().isoformat()))
+            wk = get_week_key(dt)
+            if wk not in week_dict:
+                week_dict[wk] = {"week_key":wk,"week_date":dt,"total_h":0,"energy_score":0,"warn_count":0,"stuck_count":0,"avg_scheme_score":0,"scheme_cnt":0,"mood_sum":0,"mood_cnt":0}
+            week_dict[wk]["warn_count"] +=1
+    for sch in data["scheme_records"]:
+        dt = get_week(sch.get("create_time", datetime.now().isoformat()))
+        wk = get_week_key(dt)
+        if wk not in week_dict:
+            week_dict[wk] = {"week_key":wk,"week_date":dt,"total_h":0,"energy_score":0,"warn_count":0,"stuck_count":0,"avg_scheme_score":0,"scheme_cnt":0,"mood_sum":0,"mood_cnt":0}
+        sc = (sch.get("scoreA",0)+sch.get("scoreB",0))/2
+        week_dict[wk]["avg_scheme_score"] += sc
+        week_dict[wk]["scheme_cnt"] +=1
+    out_list = []
+    for wk,item in week_dict.items():
+        if item["scheme_cnt"]>0:
+            item["avg_scheme_score"] = round(item["avg_scheme_score"]/item["scheme_cnt"],2)
+        else:
+            item["avg_scheme_score"]=0
+        if item["mood_cnt"]>0:
+            item["mood_score"] = round(item["mood_sum"]/item["mood_cnt"],2)
+        else:
+            item["mood_score"]=3
+        out_list.append(item)
+    out_list.sort(key=lambda x:x["week_date"])
+    return out_list
+
+# ====================== 网络图渲染 ======================
+def build_pyvis_network(records):
+    net = Network(
+        height="700px",
+        width="100%",
+        bgcolor="#222222",
+        font_color="white",
+        filter_menu=True,
+        cdn_resources="remote"
+    )
+    node_set = set()
+    for r in records:
+        a = r["a"].strip()
+        b = r["b"].strip()
+        link_type = r["link_type"]
+        if a not in node_set:
+            net.add_node(a, label=a, title=f"节点：{a}")
+            node_set.add(a)
+        if b not in node_set:
+            net.add_node(b, label=b, title=f"节点：{b}")
+            node_set.add(b)
+        color = "#ff4444" if r.get("trigger_high_similar_warn") else "#44aa44"
+        net.add_edge(a, b, title=f"{link_type} | {r.get('note','')}", color=color)
+    return net
+
+# ====================== 周报MD生成 ======================
+def generate_weekly_md(data, week_key=None):
+    if week_key is None:
+        week_key = get_week_key(datetime.now())
+    md = f"# 🧠 思维自检周报｜{week_key}\n\n"
+    md += "## 🔗 联想记录\n"
+    week_links = [x for x in data["concept_network"] if get_week_key(datetime.fromisoformat(x["create_time"])) == week_key]
+    for r in week_links:
+        tags = ", ".join(r.get("tags",[]))
+        md += f"- {r['a']} ➜ {r['b']}【{r['link_type']}】 tags:{tags} 备注:{r.get('note','')}\n"
+    md += "\n## 📋 生活规划\n"
+    week_plans = [x for x in data["life_plans"] if get_week_key(datetime.fromisoformat(x["create_time"])) == week_key]
+    for p in week_plans:
+        tags = ", ".join(p.get("tags",[]))
+        md += f"- {p['plan_name']}｜每周{p['weekly_hour']}h｜精力{p['energy_level']} tags:{tags}\n"
+    md += "\n## 📔 日记 & 卡点\n"
+    week_diary = [x for x in data["diary"] if get_week_key(datetime.fromisoformat(x["create_time"])) == week_key]
+    for d in week_diary:
+        tags = ", ".join(d.get("tags",[]))
+        md += f"- 情绪:{d['mood_val']}｜卡点:{d['confusion']} tags:{tags}\n"
+    md += "\n## 🛠️ 方案评估\n"
+    week_scheme = [x for x in data["scheme_records"] if get_week_key(datetime.fromisoformat(x["create_time"])) == week_key]
+    for s in week_scheme:
+        tags = ", ".join(s.get("tags",[]))
+        md += f"- 问题：{s['problem'][:60]}｜A:{s['nameA']}({s['scoreA']}) B:{s['nameB']}({s['scoreB']}) tags:{tags}\n"
+    md += "\n## ✅ 打卡 & 自测\n"
+    week_check = [x for x in data["checkin"] if get_week_key(datetime.fromisoformat(x["create_time"])) == week_key]
+    week_test = [x for x in data["self_test"] if get_week_key(datetime.fromisoformat(x["create_time"])) == week_key]
+    for c in week_check:
+        tags = ", ".join(c.get("tags",[]))
+        md += f"- 打卡：{c['task']} → {c['status']} tags:{tags}\n"
+    for t in week_test:
+        tags = ", ".join(t.get("tags",[]))
+        md += f"- 自测：{t['topic']} → {t['level']} tags:{tags}\n"
+    return md
+
+# ====================== 页面渲染函数 ======================
+def render_m01(data, sha):
+    st.header("🔗 联想跳转记录")
+    recs = data["concept_network"]
+    st.subheader("新增联想")
+    a = st.text_input("概念A")
+    b = st.text_input("概念B")
+    link_type = st.selectbox("关联类型", ["因果推导", "类比联想", "文字相似", "事实关联", "目标-手段"])
+    note = st.text_area("备注")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存联想"):
+        trigger, warn_msgs = check_high_similar_warning(a,b,link_type,data["concept_network"])
+        for w in warn_msgs:
+            st.warning(w)
+        new_item = {
+            "a":a,"b":b,"link_type":link_type,"note":note,"tags":tags,
+            "trigger_high_similar_warn":trigger,
+            "create_time":datetime.now().isoformat()
+        }
+        data["concept_network"].append(new_item)
+        save_data_to_github(data, sha)
+        st.success("✅ 已保存到GitHub！")
+        st.rerun()
+    st.divider()
+    st.subheader("历史联想")
+    for r in recs[-20:]:
+        st.write(f"{r['a']} ↔ {r['b']} | {r['link_type']} | tags:{r.get('tags')}")
+        if r.get("trigger_high_similar_warn"):
+            st.warning("⚠️ 高相似预警记录")
+
+def render_m02(data, search_text, selected_tags):
+    st.header("🔗 Pyvis交互式思维网络图")
+    recs = filter_records(data["concept_network"], search_text, selected_tags)
+    if not recs:
+        st.info("暂无联想数据")
+        return
+    net = build_pyvis_network(recs)
+    html = net.generate_html()
+    st.components.v1.html(html, height=720)
+
+def render_m03(data, search_text, selected_tags):
+    st.header("🔍 新知识关联推演")
+    st.info("输入新概念，自动检索已有相似节点，辅助建立关联")
+    new_node = st.text_input("新知识点")
+    if st.button("查找相似节点") and new_node.strip():
+        hits = []
+        for r in data["concept_network"]:
+            for side in [r["a"], r["b"]]:
+                s = sim_ratio(new_node, side)
+                if s>0.4:
+                    hits.append((s, side, r))
+        hits.sort(reverse=True, key=lambda x:x[0])
+        if not hits:
+            st.info("未找到高相似节点")
+        for score, name, item in hits[:10]:
+            st.write(f"匹配度{score:.2f} | {name} | {item['a']} ↔ {item['b']}")
+
+def render_m04(data, search_text, selected_tags):
+    st.header("🛤️ 路径搜索 + 频率分析")
+    st.info("简易：统计节点出现频次")
+    node_count = {}
+    for r in data["concept_network"]:
+        for n in [r["a"], r["b"]]:
+            node_count[n] = node_count.get(n,0)+1
+    df = pd.DataFrame(list(node_count.items()), columns=["节点","频次"])
+    df = df.sort_values("频次", ascending=False)
+    st.dataframe(df, use_container_width=True)
+
+def render_m05(data, sha):
+    st.header("🛠️ 问题方案构思｜可行性评估｜冲突检测")
+    problem = st.text_input("问题描述")
+    nameA = st.text_input("方案A名称")
+    scoreA = st.slider("方案A得分", 0,10,5)
+    nameB = st.text_input("方案B名称")
+    scoreB = st.slider("方案B得分",0,10,5)
+    h = st.number_input("预估每周耗时h",0.0,50.0,2.0)
+    energy = st.selectbox("精力消耗",["低","中","高"])
+    target = st.text_input("方案目标")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("评估并保存"):
+        conflicts = detect_plan_conflict(energy, target, data["life_plans"], data["diary"])
+        for c in conflicts:
+            st.warning(c)
+        total_h, total_es, level, tip = calc_total_load(data["life_plans"], [{"h":h,"energy":energy}])
+        st.info(f"总负载：{total_h}h，精力{total_es}，等级：{level} | {tip}")
+        new_rec = {
+            "problem":problem,"nameA":nameA,"scoreA":scoreA,"nameB":nameB,"scoreB":scoreB,
+            "h":h,"energy":energy,"target":target,"tags":tags,"create_time":datetime.now().isoformat()
+        }
+        data["scheme_records"].append(new_rec)
+        save_data_to_github(data, sha)
+        st.success("✅ 已保存方案记录")
+    st.divider()
+    recs = data["scheme_records"]
+    for r in recs[-10:]:
+        st.write(f"{r['problem'][:50]} | A:{r['nameA']}({r['scoreA']}) B:{r['nameB']}({r['scoreB']})")
+
+def render_m06(data, sha):
+    st.header("反直觉辨析练习")
+    st.info("记录容易凭直觉踩坑的命题")
+    stmt = st.text_area("命题/直觉想法")
+    counter = st.text_area("反方辨析、漏洞、反例")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存辨析"):
+        data["concept_network"].append({
+            "a":stmt,"b":counter,"link_type":"反直觉辨析","note":"","tags":tags,
+            "trigger_high_similar_warn":False,"create_time":datetime.now().isoformat()
+        })
+        save_data_to_github(data, sha)
+        st.success("✅ 保存成功")
+        st.rerun()
+    st.divider()
+    recs = [x for x in data["concept_network"] if x["link_type"]=="反直觉辨析"]
+    for r in recs[-10:]:
+        st.write(f"直觉：{r['a']}")
+        st.write(f"辨析：{r['b']}")
+        st.divider()
+
+def render_m07(data, sha):
+    st.header("目标幻想自检")
+    st.info("用来区分幻想、愿望、可落地目标")
+    goal = st.text_input("目标描述")
+    evidence = st.text_area("支撑证据、资源")
+    trap = st.text_area("容易出现的幻想陷阱")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("写入联想记录"):
+        data["concept_network"].append({
+            "a":goal,"b":evidence+" | 陷阱:"+trap,"link_type":"目标自检","note":"","tags":tags,
+            "trigger_high_similar_warn":False,"create_time":datetime.now().isoformat()
+        })
+        save_data_to_github(data, sha)
+        st.success("✅ 已记录")
+    recs = [x for x in data["concept_network"] if x["link_type"]=="目标自检"]
+    for r in recs[-8:]:
+        st.write(f"目标：{r['a']}")
+        st.write(f"核验：{r['b']}")
+        st.divider()
+
+def render_m08(data, sha):
+    st.header("生活规划自检")
+    plan_name = st.text_input("规划名称")
+    weekly_h = st.number_input("每周耗时h",0.0,40.0,5.0)
+    energy_level = st.selectbox("精力等级",["低","中","高"])
+    expect_outcome = st.text_area("预期成果")
+    confidence = st.selectbox("落地信心",["想法阶段","有大致方案","可落地，有预案"])
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存规划"):
+        data["life_plans"].append({
+            "plan_name":plan_name,"weekly_hour":weekly_h,"energy_level":energy_level,
+            "expect_outcome":expect_outcome,"confidence":confidence,"tags":tags,
+            "create_time":datetime.now().isoformat()
+        })
+        save_data_to_github(data, sha)
+        st.success("✅ 已保存")
+        st.rerun()
+    st.divider()
+    recs = data["life_plans"]
+    for r in recs:
+        st.write(f"{r['plan_name']} | {r['weekly_hour']}h/周 | 精力{r['energy_level']} | {r['confidence']}")
+
+def render_m09(data, sha):
+    st.header("每日打卡")
+    task = st.text_input("任务名称")
+    status = st.selectbox("完成状态",["未开始","进行中","完成","失败"])
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("打卡"):
+        data["checkin"].append({"task":task,"status":status,"tags":tags,"create_time":datetime.now().isoformat()})
+        save_data_to_github(data, sha)
+        st.success("✅ 打卡完成")
+        st.rerun()
+    st.divider()
+    recs = data["checkin"]
+    for r in recs[-15:]:
+        st.write(f"{r['task']} → {r['status']} | tags:{r.get('tags')}")
+
+def render_m10(data, sha):
+    st.header("情绪&状态记录")
+    mood_val = st.slider("情绪分 1很差~5很好",1,5,3)
+    note = st.text_area("状态备注")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存情绪记录"):
+        data["mood_records"].append({"mood_val":mood_val,"note":note,"tags":tags,"create_time":datetime.now().isoformat()})
+        save_data_to_github(data, sha)
+        st.success("✅ 记录完成")
+        st.rerun()
+    st.divider()
+    recs = data["mood_records"]
+    for r in recs[-10:]:
+        st.write(f"情绪分{r['mood_val']}：{r['note']}")
+
+def render_m11(data, sha):
+    st.header("📔 日记记录")
+    mood_val = st.slider("情绪分 1~5",1,5,3)
+    confusion = st.text_area("卡点、困惑")
+    thinking_trap = st.text_area("思维陷阱复盘")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存日记"):
+        data["diary"].append({"mood_val":mood_val,"confusion":confusion,"thinking_trap":thinking_trap,"tags":tags,"create_time":datetime.now().isoformat()})
+        save_data_to_github(data, sha)
+        st.success("✅ 日记已保存")
+        st.rerun()
+    st.divider()
+    recs = data["diary"]
+    for r in recs[-8:]:
+        st.write(f"情绪{r['mood_val']} | 卡点：{r['confusion']}")
+        st.write(f"陷阱：{r['thinking_trap']}")
+        st.divider()
+
+def render_m12(data, sha):
+    st.header("🔍 知识空缺分析")
+    gap_topic = st.text_input("空缺主题")
+    evidence = st.text_area("为什么判断这里是缺口、现象")
+    plan = st.text_area("补全计划")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("记录知识缺口"):
+        data["concept_network"].append({
+            "a":gap_topic,"b":evidence+" | 补全计划:"+plan,"link_type":"知识缺口","note":"","tags":tags,
+            "trigger_high_similar_warn":False,"create_time":datetime.now().isoformat()
+        })
+        save_data_to_github(data, sha)
+        st.success("✅ 已记录缺口")
+    recs = [x for x in data["concept_network"] if x["link_type"]=="知识缺口"]
+    for r in recs[-10:]:
+        st.write(f"缺口：{r['a']}")
+        st.write(f"说明：{r['b']}")
+        st.divider()
+
+def render_m13(data, sha):
+    st.header("📝 知识掌握自测")
+    topic = st.text_input("自测主题")
+    level = st.selectbox("掌握等级",["不懂","了解","能复述","会应用","精通"])
+    note = st.text_area("自测备注")
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存自测"):
+        data["self_test"].append({"topic":topic,"level":level,"note":note,"tags":tags,"create_time":datetime.now().isoformat()})
+        save_data_to_github(data, sha)
+        st.success("✅ 自测保存")
+        st.rerun()
+    st.divider()
+    recs = data["self_test"]
+    for r in recs[-12:]:
+        st.write(f"{r['topic']} → {r['level']} | {r['note']}")
+
+def render_m14(data, sha):
+    st.header("✅ 任务达标检测")
+    st.info("对标目标，检查完成度")
+    target = st.text_input("对标目标")
+    check_item = st.text_area("核查项清单")
+    pass_flag = st.selectbox("是否达标",["未核查","不达标","部分达标","达标"])
+    tag_input = st.text_input("标签，逗号分隔")
+    tags = [x.strip() for x in tag_input.split(",") if x.strip()]
+    if st.button("保存检测记录"):
+        data["task_check"].append({"target":target,"check_item":check_item,"pass_flag":pass_flag,"tags":tags,"create_time":datetime.now().isoformat()})
+        save_data_to_github(data, sha)
+        st.success("✅ 已保存")
+        st.rerun()
+    st.divider()
+    recs = data["task_check"]
+    for r in recs[-10:]:
+        st.write(f"目标：{r['target']} | 结果：{r['pass_flag']}")
+
+def render_m15(data, search_text, selected_tags):
+    st.header("使用者状态总览 & 趋势")
+    hist = aggregate_history_data(data)
+    if not hist:
+        st.info("暂无周统计数据")
+        return
+    df = pd.DataFrame(hist)
+    df["week_label"] = df["week_key"]
+    c1 = alt.Chart(df).mark_line(point=True).encode(x="week_label", y="total_h", tooltip=["week_key","total_h"]).properties(title="每周投入时长")
+    c2 = alt.Chart(df).mark_line(point=True, color="orange").encode(x="week_label", y="energy_score", tooltip=["week_key","energy_score"]).properties(title="精力总分")
+    st.altair_chart(c1, use_container_width=True)
+    st.altair_chart(c2, use_container_width=True)
+    st.dataframe(df, use_container_width=True)
+
+def render_m16(data, sha):
+    st.header("📤 导入导出 & 数据管理")
+    raw = json.dumps(data, ensure_ascii=False, indent=2)
+    st.download_button("下载备份json", raw, file_name="mind_backup.json", mime="application/json")
+    up = st.file_uploader("上传备份恢复（覆盖）")
+    if up is not None:
+        try:
+            new_data = json.load(up)
+            data.clear()
+            data.update(new_data)
+            save_data_to_github(data, sha)
+            st.success("✅ 恢复成功！")
+            st.rerun()
+        except Exception as e:
+            st.error(f"解析失败：{e}")
+
+def render_m17(data, search_text, selected_tags):
+    st.header("📄 周报Markdown导出")
+    wk = st.text_input("指定周key（留空为本周）", value="")
+    md = generate_weekly_md(data, week_key=wk if wk.strip() else None)
+    st.text_area("周报内容", md, height=500)
+    st.download_button("下载md", md, file_name="mind_weekly.md", mime="text/markdown")
+
+def render_m18(data, search_text, selected_tags):
+    st.header("查看历史记录（全部类型）")
+    st.info("全局筛选，快速翻阅")
+    all_records = []
+    for cat_name, arr in data.items():
+        for r in arr:
+            r["_cat"] = cat_name
+            all_records.append(r)
+    filtered = filter_records(all_records, search_text, selected_tags)
+    for r in filtered[-20:]:
+        st.write(f"【{r['_cat']}】 {json.dumps(r, ensure_ascii=False)[:220]}")
+        st.divider()
+
+def render_m19(data, sha):
+    st.header("🏷️ 全局标签管理（批量重命名 / 合并 / 删除）")
+    all_tags = collect_all_tags(data)
+    if not all_tags:
+        st.info("暂无标签，先去录入记录添加标签")
+        return
+    tab_rename, tab_merge, tab_delete = st.tabs(["重命名标签", "合并标签", "删除标签"])
+    with tab_rename:
+        old_tag = st.selectbox("选择要修改的旧标签", all_tags)
+        new_tag = st.text_input("新标签名称")
+        if st.button("执行重命名") and new_tag.strip():
+            cnt = 0
+            for category in data.values():
+                for rec in category:
+                    tags = rec.get("tags", [])
+                    if old_tag in tags:
+                        tags.remove(old_tag)
+                        tags.append(new_tag.strip())
+                        rec["tags"] = list(set(tags))
+                        cnt += 1
+            save_data_to_github(data, sha)
+            st.success(f"✅ 完成！共修改 {cnt} 条记录，`{old_tag}` → `{new_tag}`")
+            st.rerun()
+    with tab_merge:
+        source_tags = st.multiselect("选择要合并的源标签（多选）", all_tags)
+        target_tag = st.selectbox("合并到目标标签", all_tags)
+        if st.button("执行合并") and source_tags:
+            cnt = 0
+            for category in data.values():
+                for rec in category:
+                    tags = rec.get("tags", [])
+                    has_change = False
+                    for s in source_tags:
+                        if s in tags and s != target_tag:
+                            tags.remove(s)
+                            has_change = True
+                    if has_change and target_tag not in tags:
+                        tags.append(target_tag)
+                        rec["tags"] = list(set(tags))
+                        cnt += 1
+            save_data_to_github(data, sha)
+            st.success(f"✅ 合并完成，影响 {cnt} 条记录")
+            st.rerun()
+    with tab_delete:
+        del_tag = st.selectbox("选择要删除的标签", all_tags)
+        confirm = st.checkbox(f"确认永久删除标签【{del_tag}】，无法撤销")
+        if confirm and st.button("删除标签"):
+            cnt = 0
+            for category in data.values():
+                for rec in category:
+                    tags = rec.get("tags", [])
+                    if del_tag in tags:
+                        tags.remove(del_tag)
+                        rec["tags"] = tags
+                        cnt += 1
+            save_data_to_github(data, sha)
+            st.success(f"✅ 标签已移除，共清理 {cnt} 条记录")
+            st.rerun()
+    st.divider()
+    st.subheader("当前全部标签列表")
+    st.write(all_tags)
+
+# ====================== 主入口 ======================
+st.set_page_config(
+    page_title="思维自检与规划系统｜GitHub持久化版",
+    layout="wide"
+)
+
+# 加载数据
+data, sha = load_data_from_github()
+all_tags = collect_all_tags(data)
+
+menu_list = [
+    "联想跳转记录",
+    "🔗 Pyvis交互式思维网络图",
+    "🔍 新知识关联推演",
+    "🛤️ 路径搜索 + 频率分析",
+    "🛠️ 问题方案构思｜可行性评估｜冲突检测",
+    "反直觉辨析练习",
+    "目标幻想自检",
+    "生活规划自检",
+    "每日打卡",
+    "情绪&状态记录",
+    "📔 日记记录",
+    "🔍 知识空缺分析",
+    "📝 知识掌握自测",
+    "✅ 任务达标检测",
+    "使用者状态总览",
+    "🏷️ 全局标签管理",
+    "📤 导入导出 & 数据管理",
+    "📄 周报Markdown导出",
+    "查看历史记录"
+]
+
+with st.sidebar:
+    st.title("🔍 全局筛选")
+    search_text = st.text_input("全文搜索", placeholder="关键词，模糊匹配所有记录")
+    selected_tags = st.multiselect("标签筛选", options=all_tags, default=[], placeholder="多选标签，满足其一即匹配")
+    st.divider()
+    menu = st.radio("选择模式", menu_list)
+    st.sidebar.divider()
+    st.sidebar.info("💡 数据自动保存在GitHub仓库，容器重启不丢失")
+
+if menu == "联想跳转记录":
+    render_m01(data, sha)
+elif menu == "🔗 Pyvis交互式思维网络图":
+    render_m02(data, search_text, selected_tags)
+elif menu == "🔍 新知识关联推演":
+    render_m03(data, search_text, selected_tags)
+elif menu == "🛤️ 路径搜索 + 频率分析":
+    render_m04(data, search_text, selected_tags)
+elif menu == "🛠️ 问题方案构思｜可行性评估｜冲突检测":
+    render_m05(data, sha)
+elif menu == "反直觉辨析练习":
+    render_m06(data, sha)
+elif menu == "目标幻想自检":
+    render_m07(data, sha)
+elif menu == "生活规划自检":
+    render_m08(data, sha)
+elif menu == "每日打卡":
+    render_m09(data, sha)
+elif menu == "情绪&状态记录":
+    render_m10(data, sha)
+elif menu == "📔 日记记录":
+    render_m11(data, sha)
+elif menu == "🔍 知识空缺分析":
+    render_m12(data, sha)
+elif menu == "📝 知识掌握自测":
+    render_m13(data, sha)
+elif menu == "✅ 任务达标检测":
+    render_m14(data, sha)
+elif menu == "使用者状态总览":
+    render_m15(data, search_text, selected_tags)
+elif menu == "🏷️ 全局标签管理":
+    render_m19(data, sha)
+elif menu == "📤 导入导出 & 数据管理":
+    render_m16(data, sha)
+elif menu == "📄 周报Markdown导出":
+    render_m17(data, search_text, selected_tags)
+elif menu == "查看历史记录":
+    render_m18(data, search_text, selected_tags)
