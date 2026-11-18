@@ -1,0 +1,1 @@
+# mind_self_chek
